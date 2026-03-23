@@ -145,9 +145,10 @@ func (qr *QueryResults) Drain(ctx context.Context, handler ResultBatchHandler) e
 	if qr == nil {
 		return errors.New("cannot drain results: nil QueryResults")
 	}
-	for qr.HasMoreBatch() {
-		if err := qr.FetchNextBatch(ctx); err != nil {
-			return fmt.Errorf("drain operation failed: %w", err)
+
+	processBatch := func() error {
+		if len(qr.Data) == 0 {
+			return nil
 		}
 		if handler != nil {
 			if err := handler(qr); err != nil {
@@ -157,6 +158,20 @@ func (qr *QueryResults) Drain(ctx context.Context, handler ResultBatchHandler) e
 		}
 		// Aggressively clear Data to prevent memory bloat during large drains
 		qr.Data = nil
+		return nil
+	}
+
+	if err := processBatch(); err != nil {
+		return err
+	}
+
+	for qr.HasMoreBatch() {
+		if err := qr.FetchNextBatch(ctx); err != nil {
+			return fmt.Errorf("drain operation failed: %w", err)
+		}
+		if err := processBatch(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
