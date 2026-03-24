@@ -26,6 +26,8 @@ const (
 	CatalogHeader            = "X-Presto-Catalog"
 	SchemaHeader             = "X-Presto-Schema"
 	SessionHeader            = "X-Presto-Session"
+	SetSessionHeader         = "X-Presto-Set-Session"
+	ClearSessionHeader       = "X-Presto-Clear-Session"
 	TransactionHeader        = "X-Presto-Transaction-Id"
 	StartedTransactionHeader = "X-Presto-Started-Transaction-Id"
 	ClearTransactionHeader   = "X-Presto-Clear-Transaction-Id"
@@ -65,9 +67,13 @@ type Session struct {
 	mu sync.RWMutex
 }
 
-// Client serves as the factory and network configuration provider
+// Client serves as the factory and network configuration provider.
+// The clientMu protects Client-level fields (httpClient, serverUrl, isTrino,
+// forceHTTPS) during concurrent access. Session-level fields are separately
+// protected by Session.mu.
 type Client struct {
 	Session    // Embedded default session
+	clientMu   sync.RWMutex
 	httpClient *http.Client
 	serverUrl  *url.URL
 	isTrino    bool
@@ -363,9 +369,13 @@ func (s *Session) Do(ctx context.Context, req *http.Request, v any) (*http.Respo
 		}
 	}
 
+	s.client.clientMu.RLock()
+	httpClient := s.client.httpClient
+	s.client.clientMu.RUnlock()
+
 	retryDelay := time.Second
 	for attempt := 0; attempt < MaxRetryAttempts; attempt++ {
-		resp, err := s.client.httpClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			// Bail out immediately if the context is done, even if the error
 			// itself looks like a retryable network error (e.g. signal interrupt).
@@ -380,7 +390,11 @@ func (s *Session) Do(ctx context.Context, req *http.Request, v any) (*http.Respo
 			log.Debug().Err(err).Int("attempt", attempt+1).Msg("retrying on connection error")
 
 			if req.GetBody != nil {
-				req.Body, _ = req.GetBody()
+				body, bodyErr := req.GetBody()
+				if bodyErr != nil {
+					return nil, fmt.Errorf("failed to reset request body for retry: %w", bodyErr)
+				}
+				req.Body = body
 			}
 
 			if err := retrySleep(ctx, retryDelay); err != nil {
@@ -394,6 +408,7 @@ func (s *Session) Do(ctx context.Context, req *http.Request, v any) (*http.Respo
 		}
 
 		s.updateTransactionState(resp)
+		s.updateSessionProperties(resp)
 
 		if resp.StatusCode == http.StatusOK {
 			err = s.client.decodeResponseBody(resp, v)
@@ -407,7 +422,11 @@ func (s *Session) Do(ctx context.Context, req *http.Request, v any) (*http.Respo
 
 			// Reset the request body for the next attempt
 			if req.GetBody != nil {
-				req.Body, _ = req.GetBody()
+				body, bodyErr := req.GetBody()
+				if bodyErr != nil {
+					return nil, fmt.Errorf("failed to reset request body for retry: %w", bodyErr)
+				}
+				req.Body = body
 			}
 
 			if err := retrySleep(ctx, retryDelay); err != nil {
@@ -465,26 +484,70 @@ func (s *Session) updateTransactionState(resp *http.Response) {
 	}
 }
 
+// updateSessionProperties processes X-Presto-Set-Session and X-Presto-Clear-Session
+// response headers. The server sends these when SET SESSION or RESET SESSION statements
+// are executed. Format: "key=urlEncodedValue" for Set, "key" for Clear.
+func (s *Session) updateSessionProperties(resp *http.Response) {
+	setKey := s.client.CanonicalHeader(SetSessionHeader)
+	clearKey := s.client.CanonicalHeader(ClearSessionHeader)
+
+	// Cheap existence check before allocating slices.
+	if resp.Header.Get(setKey) == "" && resp.Header.Get(clearKey) == "" {
+		return
+	}
+
+	setValues := resp.Header.Values(setKey)
+	clearValues := resp.Header.Values(clearKey)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, h := range setValues {
+		key, val, ok := strings.Cut(h, "=")
+		if !ok {
+			log.Warn().Str("header", h).Msg("malformed X-Presto-Set-Session header, skipping")
+			continue
+		}
+		decoded, err := url.QueryUnescape(val)
+		if err != nil {
+			log.Warn().Err(err).Str("header", h).Msg("failed to unescape X-Presto-Set-Session value, skipping")
+			continue
+		}
+		s.sessionParams[key] = decoded
+	}
+	for _, h := range clearValues {
+		delete(s.sessionParams, h)
+	}
+}
+
 // --- Client Configuration & Delegation ---
 
 func (c *Client) IsTrino(isTrino bool) *Client {
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
 	c.isTrino = isTrino
 	return c
 }
 
 func (c *Client) ForceHTTPS(force bool) *Client {
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
 	c.forceHTTPS = force
 	return c
 }
 
 // GetHost returns the host (and port, if present) of the server URL.
 func (c *Client) GetHost() string {
+	c.clientMu.RLock()
+	defer c.clientMu.RUnlock()
 	return c.serverUrl.Host
 }
 
 // HTTPClient replaces the underlying http.Client. Use this to provide a
 // client with custom TLS configuration, timeouts, or transport settings.
 func (c *Client) HTTPClient(hc *http.Client) *Client {
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
 	c.httpClient = hc
 	return c
 }
@@ -493,6 +556,8 @@ func (c *Client) HTTPClient(hc *http.Client) *Client {
 // already has a custom transport that is not an *http.Transport, this is
 // a no-op and the caller should use HTTPClient instead.
 func (c *Client) TLSConfig(cfg *tls.Config) *Client {
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
 	transport, ok := c.httpClient.Transport.(*http.Transport)
 	if !ok {
 		if c.httpClient.Transport == nil {
@@ -509,11 +574,16 @@ func (c *Client) TLSConfig(cfg *tls.Config) *Client {
 // --- Client Networking Utilities ---
 
 func (c *Client) prepareURL(urlStr string) (*url.URL, error) {
-	u, err := c.serverUrl.Parse(urlStr)
+	c.clientMu.RLock()
+	serverUrl := c.serverUrl
+	forceHTTPS := c.forceHTTPS
+	c.clientMu.RUnlock()
+
+	u, err := serverUrl.Parse(urlStr)
 	if err != nil {
 		return nil, err
 	}
-	if c.forceHTTPS && u.Scheme == "http" {
+	if forceHTTPS && u.Scheme == "http" {
 		u.Scheme = "https"
 	}
 	return u, nil
@@ -539,7 +609,11 @@ func (c *Client) prepareRequestBody(body any) (io.Reader, string, error) {
 // ecosystem while allowing the internal code to use a single, consistent
 // naming convention.
 func (c *Client) CanonicalHeader(name string) string {
-	if c.isTrino {
+	c.clientMu.RLock()
+	isTrino := c.isTrino
+	c.clientMu.RUnlock()
+
+	if isTrino {
 		return strings.Replace(name, "X-Presto", "X-Trino", 1)
 	}
 	return name
@@ -602,7 +676,7 @@ func (c *Client) decodeResponseBody(resp *http.Response, v any) (err error) {
 	}
 
 	if err = json.NewDecoder(reader).Decode(v); err != nil {
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return nil
 		}
 		return fmt.Errorf("failed to decode JSON: %w", err)

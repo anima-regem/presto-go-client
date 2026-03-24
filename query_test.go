@@ -54,7 +54,8 @@ func TestMockServer_DistributedLatency(t *testing.T) {
 	mockServer := prestotest.NewMockPrestoServer()
 	defer mockServer.Close()
 
-	client, _ := presto.NewClient(mockServer.URL(), "")
+	client, err := presto.NewClient(mockServer.URL(), "")
+	require.NoError(t, err)
 	session := client.NewSession()
 
 	// Setup: 200ms total latency, 1 data batch (Total 2 requests: initial + batch 1)
@@ -89,7 +90,8 @@ func TestQueryResults_DrainSuccess(t *testing.T) {
 	mockServer := prestotest.NewMockPrestoServer()
 	defer mockServer.Close()
 
-	client, _ := presto.NewClient(mockServer.URL(), "")
+	client, err := presto.NewClient(mockServer.URL(), "")
+	require.NoError(t, err)
 	session := client.NewSession()
 
 	data := [][]any{{1}, {2}, {3}, {4}, {5}}
@@ -99,10 +101,11 @@ func TestQueryResults_DrainSuccess(t *testing.T) {
 		DataBatches: 3,
 	})
 
-	results, _, _ := session.Query(context.Background(), "SELECT * FROM drain")
+	results, _, err := session.Query(context.Background(), "SELECT * FROM drain")
+	require.NoError(t, err)
 
 	rowCount := 0
-	err := results.Drain(context.Background(), func(qr *presto.QueryResults) error {
+	err = results.Drain(context.Background(), func(qr *presto.QueryResults) error {
 		rowCount += len(qr.Data)
 		// Verify memory optimization: Data should exist during handler
 		assert.NotEmpty(t, qr.Data)
@@ -136,7 +139,8 @@ func TestQueryResults_DrainHandlerError(t *testing.T) {
 	mockServer := prestotest.NewMockPrestoServer()
 	defer mockServer.Close()
 
-	client, _ := presto.NewClient(mockServer.URL(), "")
+	client, err := presto.NewClient(mockServer.URL(), "")
+	require.NoError(t, err)
 	session := client.NewSession()
 
 	mockServer.AddQuery(&prestotest.MockQueryTemplate{
@@ -145,10 +149,11 @@ func TestQueryResults_DrainHandlerError(t *testing.T) {
 		DataBatches: 2,
 	})
 
-	results, _, _ := session.Query(context.Background(), "SELECT * FROM fail_drain")
+	results, _, queryErr := session.Query(context.Background(), "SELECT * FROM fail_drain")
+	require.NoError(t, queryErr)
 
 	handlerErr := errors.New("handler failed")
-	err := results.Drain(context.Background(), func(qr *presto.QueryResults) error {
+	err = results.Drain(context.Background(), func(qr *presto.QueryResults) error {
 		return handlerErr
 	})
 
@@ -273,4 +278,64 @@ func TestQueryResults_ConcurrentAccess(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// TestQuery_SetSessionFromResponse verifies that X-Presto-Set-Session response headers
+// update session properties for subsequent requests.
+func TestQuery_SetSessionFromResponse(t *testing.T) {
+	mockServer := prestotest.NewMockPrestoServer()
+	defer mockServer.Close()
+
+	mockServer.AddQuery(&prestotest.MockQueryTemplate{
+		SQL:     "SET SESSION optimize_hash_generation = true",
+		Columns: []presto.Column{{Name: "result", Type: "boolean"}},
+		Data:    [][]any{{true}},
+		SetSessionProperties: map[string]string{
+			"optimize_hash_generation": "true",
+		},
+	})
+
+	mockServer.AddQuery(&prestotest.MockQueryTemplate{
+		SQL:     "SELECT 1",
+		Columns: []presto.Column{{Name: "_col0", Type: "integer"}},
+		Data:    [][]any{{1}},
+	})
+
+	client, _ := presto.NewClient(mockServer.URL(), "")
+	session := client.NewSession()
+
+	// Execute SET SESSION — should update session params
+	_, _, err := session.Query(context.Background(), "SET SESSION optimize_hash_generation = true")
+	require.NoError(t, err)
+
+	assert.Equal(t, "optimize_hash_generation=true", session.GetSessionParams())
+
+	// Verify the session property is sent on subsequent queries
+	_, _, err = session.Query(context.Background(), "SELECT 1")
+	require.NoError(t, err)
+}
+
+// TestQuery_ClearSessionFromResponse verifies that X-Presto-Clear-Session response headers
+// remove session properties.
+func TestQuery_ClearSessionFromResponse(t *testing.T) {
+	mockServer := prestotest.NewMockPrestoServer()
+	defer mockServer.Close()
+
+	mockServer.AddQuery(&prestotest.MockQueryTemplate{
+		SQL:                    "RESET SESSION optimize_hash_generation",
+		Columns:                []presto.Column{{Name: "result", Type: "boolean"}},
+		Data:                   [][]any{{true}},
+		ClearSessionProperties: []string{"optimize_hash_generation"},
+	})
+
+	client, _ := presto.NewClient(mockServer.URL(), "")
+	session := client.NewSession().SessionParam("optimize_hash_generation", "true")
+
+	assert.Equal(t, "optimize_hash_generation=true", session.GetSessionParams())
+
+	// Execute RESET SESSION — should clear the param
+	_, _, err := session.Query(context.Background(), "RESET SESSION optimize_hash_generation")
+	require.NoError(t, err)
+
+	assert.Equal(t, "", session.GetSessionParams())
 }
